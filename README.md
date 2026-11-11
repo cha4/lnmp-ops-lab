@@ -1,158 +1,158 @@
-# LNMP 多服务环境与性能调优实践
+# LNMP 多服务环境 · 性能调优 · 监控告警 · 故障演练
 
-> 单台虚拟机上用 Docker Compose 编排 Nginx + PHP-FPM + MySQL + Redis 四层服务，
-> 完成「跑通 → 建基线 → 找瓶颈 → 调优 → 复测」的完整闭环。
+> 在单台虚拟机上用 Docker Compose 编排 Nginx + PHP-FPM + MySQL + Redis，
+> 完成「跑通 → 压测 → 调优 → 监控 → 告警 → 故障演练 → 修复复验」的完整闭环。
 
-## 1. 项目背景
+## 1. 项目目标
 
-中小企业最常见的 Web 架构就是 LNMP：Nginx 做入口，PHP-FPM 跑业务，MySQL 存数据，Redis 做缓存。
-本项目把这套架构容器化，并针对一个真实页面做性能优化，目标是回答三个问题：
-
-1. 这套环境能不能一键复现？
-2. 它的承载能力上限在哪里？
-3. 瓶颈出现时，怎么定位、怎么验证？
+1. 环境能否一键复现？
+2. 承载能力上限在哪里？瓶颈是什么？
+3. 出了故障能不能被发现、被定位、被降级？
 
 ## 2. 架构
 
-```
-                浏览器 / 压测客户端
-                        │
-                        ▼  :8080
-                ┌───────────────┐
-                │  nginx 容器    │  反向代理 + 静态资源
-                └───────┬───────┘
-                        │ fastcgi 9000（容器名解析）
-                ┌───────▼───────┐
-                │   php 容器     │  PHP-FPM + OPcache
-                └───┬───────┬───┘
-                    │       │
-        TCP 3306    │       │   TCP 6379
-        ┌───────────▼──┐  ┌─▼────────────┐
-        │  mysql 容器   │  │  redis 容器   │
-        │  持久化数据    │  │  缓存热点数据  │
-        └──────────────┘  └──────────────┘
-```
+| 层 | 容器 | 端口 | 职责 |
+|---|---|---|---|
+| 接入 | nginx | 8080 → 80 | 反向代理、静态资源、fastcgi 转发 |
+| 应用 | php | 9000（仅内网） | PHP-FPM + OPcache，执行页面逻辑 |
+| 数据 | mysql | 3306（仅内网） | 持久化到命名卷 `mysql-data` |
+| 缓存 | redis | 6379（仅内网） | 商品列表缓存，TTL 60s |
+| 监控 | prometheus / grafana / cadvisor / node-exporter | 9090 / 3000 | 采集、存储、可视化 |
+
+请求路径：浏览器 → nginx:8080 →（fastcgi）php:9000 → mysql:3306 或 redis:6379。
+容器间通过**容器名**互相访问，由 Docker 内置 DNS 解析。
 
 ## 3. 运行环境
 
 | 项 | 版本 / 配置 |
 |---|---|
-| 宿主机 | Windows + VMware Workstation |
 | 虚拟机 | CentOS 7.9，4 vCPU / 8 GB / 60 GB |
-| Docker | 26.1.4 |
-| Docker Compose | v2.27.1 |
-| Nginx | 1.27.5-alpine |
-| PHP | 8.2.35-fpm（含 pdo_mysql、redis 扩展、OPcache） |
-| MySQL | 8.0.46 |
-| Redis | 7-alpine |
+| Docker / Compose | 26.1.4 / v2.27.1 |
+| Nginx / PHP | 1.27.5-alpine / 8.2.35-fpm（pdo_mysql、redis、OPcache） |
+| MySQL / Redis | 8.0.46 / 7-alpine |
+| 监控 | Prometheus 2.54.1、Grafana 11.2.0、cAdvisor 0.53.0、node-exporter 1.8.2 |
+| 压测 | ab (ApacheBench 2.3) |
 
 ## 4. 目录结构
 
 ```
 /opt/lnmp
 ├── docker-compose.yml            # 服务编排
-├── docker-compose.override.yml   # 本地覆盖（OPcache 配置挂载）
-├── nginx/
-│   └── default.conf              # 反向代理 + fastcgi 转发
+├── docker-compose.override.yml   # OPcache 挂载 + 监控组件
+├── .env                          # 真实密码（不进 Git）
+├── .env.example                  # 变量模板（进 Git）
+├── nginx/default.conf            # 反代 + fastcgi + backlog
 ├── php/
 │   ├── Dockerfile                # php:8.2-fpm + pdo_mysql + redis
-│   ├── opcache.ini               # OPcache 参数
-│   └── zz-custom.conf            # PHP-FPM 进程池（覆盖默认 www.conf）
+│   ├── opcache.ini
+│   └── zz-custom.conf            # 进程池：static, 16 worker
 ├── app/
-│   └── index.php                 # 示例页面：查缓存 → 回源 → 渲染
-├── sql/
-│   └── init.sql                  # 建表 + 初始数据（含 SET NAMES）
+│   ├── index.php                 # 缓存 + 降级 + 熔断
+│   └── metrics.php               # 自研 Prometheus 指标端点
+├── sql/init.sql
+├── monitoring/
+│   ├── prometheus.yml
+│   └── grafana/provisioning/datasources/prometheus.yml
+├── docs/
+│   ├── STATUS.md
+│   └── drill-redis-degradation.md
 └── README.md
 ```
 
 ## 5. 快速开始
 
 ```bash
-cd /opt/lnmp
+cp .env.example .env      # 填入真实密码
 docker compose up -d
-docker compose ps
 curl -s http://localhost:8080 | grep 状态
 ```
 
-首次启动会自动初始化数据库、构建 PHP 镜像（约 2 分钟）。
+- 应用：http://<ip>:8080
+- Grafana：http://<ip>:3000（admin / 见 .env）
+- Prometheus：http://<ip>:9090
 
-## 6. 关键配置说明
+## 6. 关键设计
 
-| 配置 | 作用 | 为什么这么做 |
+| 设计 | 做法 | 原因 |
 |---|---|---|
-| `fastcgi_pass php:9000` | 容器间通信 | 用**容器名**而非 IP，Docker 内置 DNS 负责解析，容器重建后地址变化也不影响 |
-| `depends_on` + `healthcheck` | 启动顺序 | `depends_on` 只保证启动先后，**不保证服务就绪**；healthcheck 才是真正的就绪判断 |
-| `volumes: mysql-data` | 数据持久化 | 命名卷独立于容器生命周期，`down` 后数据仍在 |
-| `./app:/var/www/html` | 代码挂载 | 改代码不用重建镜像 |
-| `SET NAMES utf8mb4` | 字符集 | 导入时客户端字符集不确定，会话级强制 utf8mb4 防止中文双重编码 |
-| `zz-custom.conf` | 进程池 | 以 `zz-` 开头，排在 `www.conf` 之后加载，覆盖默认值 |
+| 服务发现 | `fastcgi_pass php:9000`、`host=mysql` | 用容器名而非 IP，容器重建后地址变化不影响 |
+| 启动依赖 | `depends_on` + `healthcheck` | 前者只管顺序，后者才判断“真的可用” |
+| 数据持久化 | 命名卷 `mysql-data` | 容器删除数据仍在 |
+| 字符集 | 建表 utf8mb4 + 连接串 charset + `SET NAMES` | 三处一致，否则双重编码 |
+| 配置与秘钥 | `.env` + 环境变量 | 敏感信息不进版本库 |
 
-## 7. 性能优化过程（核心）
-
-### 7.1 结果总览
+## 7. 性能优化（四轮）
 
 | 阶段 | 关键改动 | QPS | P95 | P99 |
 |---|---|---|---|---|
-| 基线 | 默认配置（5 worker，dynamic） | 598 | 382 ms | 3014 ms |
-| 第一次调优 | worker 5 → 8（static） | 950 | 136 ms | 1325 ms |
-| 第二次调优 | 启用 OPcache + PDO 持久连接 | 980 | 90 ms | 1098 ms |
-| 第三次调优 | 引入 Redis 缓存商品列表 | 1558 | 130 ms | 1084 ms |
-| 第四次调优 | 修复 listen 队列 + worker 8 → 16 | **1700** | **125 ms** | **1082 ms** |
+| 基线 | 默认 5 worker / dynamic | 598 | 382 ms | 3014 ms |
+| 第一轮 | worker → 8 / static | 950 | 136 ms | 1325 ms |
+| 第二轮 | + OPcache + PDO 持久连接 | 980 | 90 ms | 1098 ms |
+| 第三轮 | + Redis 缓存 | 1558 | 130 ms | 1084 ms |
+| 第四轮 | + 内核队列 + worker 16 | **1700** | **125 ms** | **1082 ms** |
 | 累计 | | **+184%** | **−67%** | **−64%** |
 
-### 7.2 每一次调优的依据
+每一轮的依据：
 
-**① 基线：QPS 598，P99 3014ms**
+- **基线反推**：`598 × 0.008s ≈ 5`，恰好等于 `pm.max_children` 默认值，锁定进程数瓶颈。
+- **进程数**：4 核机器上超过 8 个 worker 后 QPS 不再增长，32 个反而下降（上下文切换）。
+- **OPcache / 持久连接**：QPS 不变但 P95 从 136→90ms，说明优化的是延迟不是吞吐。
+- **Redis**：MySQL CPU 从 94% 降到 0.6%，QPS 提升 59%。
+- **内核队列**：`ListenOverflows=101`，`somaxconn=128` 导致半连接队列溢出、SYN 重传，表现为 2 秒级尾延迟。
 
-反推发现 `598 × 0.008s ≈ 5`，恰好等于 `pm.max_children` 的默认值，判断瓶颈在 PHP 进程数。
+压测方法：`ab -n 20000 -c 200 -k`，预热缓存后连跑三次取中位数。
+⚠️ 单机压测（压测端与被测端共享 4 核），数据偏保守，仅用于前后对比。
 
-**② worker 5 → 8**
+## 8. 监控与告警
 
-4 核机器上，8 个 worker 已能喂满 CPU；继续加到 32 反而因上下文切换而降速。
-结论：`max_children` 的上限由 **CPU 核数**和**内存**共同决定，不是越大越好。
+**采集**：cAdvisor（容器）、node-exporter（主机）、自研 `/metrics.php`（应用），Prometheus 每 5s 拉取。
 
-**③ OPcache + 持久连接**
+**面板**（Grafana「LNMP 监控」）：容器 CPU／内存／网络、主机负载、QPS、关键状态（存活容器、抓取状态）。
 
-QPS 几乎不变（CPU 已满），但 P95 从 136ms 降到 90ms。
-结论：优化连接建立开销 ≠ 优化查询本身。
+**告警**：`PHP 容器 CPU > 0.5 核`，评估周期 10s、Pending 30s，Webhook 通知。
 
-**④ Redis 缓存**
+**验证**：压测触发后状态 `Normal → Pending → Firing`，21:59 触发、22:01 恢复，Webhook 收到 `firing` 与 `resolved` 两条通知。
 
-MySQL CPU 从 94% 降到 0.6%，QPS 提升 59%。
-结论：把重复查询移到内存，是收益最大的一步。
+**自研指标端点**（`app/metrics.php`）：
 
-**⑤ 内核队列 + worker 16**
-
-`ListenOverflows = 101`，说明 `somaxconn=128` 导致半连接队列溢出、SYN 重传，
-表现为 P99 的 2 秒尖刺。调大内核队列与 Nginx `backlog` 后尖刺消失。
-
-## 8. 压测方法
-
-```bash
-# 预热缓存，保证响应长度一致
-curl -s http://localhost:8080 > /dev/null
-curl -s http://localhost:8080 > /dev/null
-
-# 稳态压测：20000 请求、200 并发、keep-alive
-ab -n 20000 -c 200 -k http://127.0.0.1:8080/
+```
+app_requests_total 12345     # 请求总数（读本地文件，不依赖 Redis）
 ```
 
-**读结果只看三个数**：`Requests per second`（QPS）、`95%`、`99%`。
-`Failed requests` 是按响应长度判定的，页面内容变化时会产生假失败，真错误看 `Non-2xx responses`。
+> 设计要点：**观测端点不能依赖被观测的依赖**。最初 `/metrics.php` 需要连 Redis，Redis 一挂监控目标直接 DOWN，什么都看不到；改为读本地文件后，故障期间监控仍可用。
 
-## 9. 三个测量陷阱（踩过的坑）
+## 9. 故障演练
 
-1. **`Failed requests: 19999` 是假象**：页面在"缓存命中/回源查询"两种状态下长度不同，被 ab 全判为失败。
-2. **`-n 3000` 测的是启动阶段**：压测时长不足时数据偏低，必须跑到稳态（≥30 秒或上万请求）。
-3. **`sed -i` 改配置容器看不到**：`sed -i` 会替换 inode，bind mount 仍指向旧文件；改完必须重建容器。
+### 缓存不可用（Redis 停机）
 
-## 10. 已知问题与改进方向
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 页面 | 报错（HTTP 200 但内容失败） | 正常显示商品 |
+| QPS | 20.37 | **857.67** |
+| P95 | 5172 ms | **183 ms** |
+| MySQL CPU | 0.02 核（未被访问） | 0.156 核 |
+| 首请求耗时 | 5 s（DNS 超时） | 0.102 s（熔断） |
 
-- 当前是**单机压测**：`ab` 与被测服务共享 4 个 vCPU，数据偏保守，只能做前后对比。
-- **单点部署**：任一容器故障即服务不可用，下一步做双节点 + 上游健康检查。
-- **无 HTTPS / 域名**：实验环境未配置证书。
-- **无监控**：目前靠压测报告看数据，后续接入 Prometheus + Grafana。
+修复手段：**降级**（Redis 失败回退查 MySQL）+ **熔断**（失败后 30s 内不再尝试 Redis）。
+详见 `docs/drill-redis-degradation.md`。
+
+### 其他已遇到的问题
+
+| 问题 | 根因 | 处理 |
+|---|---|---|
+| 容器全 Up 但端口不通 | firewalld 重新启用，覆盖 Docker 转发规则 | 关闭 firewalld + 重启 Docker |
+| 改配置容器不生效 | `sed -i` 替换 inode，bind mount 仍指向旧文件 | 重建容器，或原地写入 |
+| 中文乱码 | 导入时客户端字符集为 latin1，双重编码 | `--default-character-set=utf8mb4` + `SET NAMES` |
+| 指标查不到 | cAdvisor 该版本用 `name` 标签而非 `container` | 先查 label 再写 PromQL |
+| 改代码不生效 | OPcache `validate_timestamps=0` | 重启 php 容器 |
+
+## 10. 已知问题与规划
+
+- 单机部署：应用与数据库均为单实例，存在单点。
+- 单机压测：数据偏保守，绝对值无参考意义。
+- 未实现限流：数据库被打满时缺少保护。
+- 规划：双节点 + upstream 健康检查、MySQL 主从、限流与熔断策略完善。
 
 ## 11. 技术栈
 
-Nginx · PHP-FPM · MySQL · Redis · Docker · Docker Compose · ab · Linux 内核参数调优
+Nginx · PHP-FPM · MySQL · Redis · Docker · Docker Compose · Prometheus · Grafana · cAdvisor · Linux 内核调优
