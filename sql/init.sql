@@ -1,0 +1,11 @@
+SET NAMES utf8mb4;
+CREATE TABLE IF NOT EXISTS products (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(50) NOT NULL,
+  price DECIMAL(10,2) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT INTO products (name, price) VALUES
+('测试商品A', 99.00),
+('测试商品B', 129.00),
+('测试商品C', 59.90);
