@@ -15,6 +15,12 @@ services:
     build: ./php
     image: lnmp/php:1.0
     container_name: php
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: ${MYSQL_DATABASE}
+      DB_USER: root
+      DB_PASS: ${MYSQL_ROOT_PASSWORD}
     volumes:
       - ./app:/var/www/html
       - ./php/zz-custom.conf:/usr/local/etc/php-fpm.d/zz-custom.conf:ro

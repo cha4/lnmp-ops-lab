@@ -43,10 +43,20 @@ if ($now >= $downUntil) {
 // ---- 缓存未命中或不可用 → 回退查 MySQL（降级）----
 if ($rows === []) {
     try {
-        $pdo = new PDO('mysql:host=mysql;dbname=shop;charset=utf8mb4', 'root', 'Root@123456', [
-            PDO::ATTR_ERRMODE    => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_PERSISTENT => true,
-        ]);
+        $dbHost = getenv('DB_HOST') ?: 'mysql';
+        $dbName = getenv('DB_NAME') ?: 'shop';
+        $dbUser = getenv('DB_USER') ?: 'root';
+        $dbPass = getenv('DB_PASS') ?: '';
+
+        $pdo = new PDO(
+            sprintf('mysql:host=%s;dbname=%s;charset=utf8mb4', $dbHost, $dbName),
+            $dbUser,
+            $dbPass,
+            [
+                PDO::ATTR_ERRMODE    => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_PERSISTENT => true,
+            ]
+        );
         $rows = $pdo->query('SELECT id, name, price FROM products')->fetchAll(PDO::FETCH_ASSOC);
 
         if ($redis !== null) {
