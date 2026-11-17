@@ -44,12 +44,13 @@ if ($now >= $downUntil) {
 if ($rows === []) {
     try {
         $dbHost = getenv('DB_HOST') ?: 'mysql';
+        $dbPort = getenv('DB_PORT') ?: '3306';
         $dbName = getenv('DB_NAME') ?: 'shop';
         $dbUser = getenv('DB_USER') ?: 'root';
         $dbPass = getenv('DB_PASS') ?: '';
 
         $pdo = new PDO(
-            sprintf('mysql:host=%s;dbname=%s;charset=utf8mb4', $dbHost, $dbName),
+            sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $dbHost, $dbPort, $dbName),
             $dbUser,
             $dbPass,
             [
@@ -58,6 +59,7 @@ if ($rows === []) {
             ]
         );
         $rows = $pdo->query('SELECT id, name, price FROM products')->fetchAll(PDO::FETCH_ASSOC);
+        $serverId = $pdo->query('SELECT @@server_id')->fetchColumn();
 
         if ($redis !== null) {
             try {
@@ -80,6 +82,7 @@ if ($rows === []) {
 <h1>LNMP 环境已打通</h1>
 <p>容器：<?= gethostname() ?> ｜ PHP：<?= PHP_VERSION ?></p>
 <p>状态：<?= htmlspecialchars($status) ?></p>
+<p>数据节点：<?= isset($serverId) ? 'server_id=' . htmlspecialchars((string)$serverId) . '（1=主库 2=从库）' : 'Redis 缓存' ?></p>
 <ul>
 <?php foreach ($rows as $r): ?>
     <li><?= $r['id'] ?> - <?= htmlspecialchars($r['name']) ?> - ￥<?= $r['price'] ?></li>

@@ -1,0 +1,29 @@
+groups:
+  - name: lnmp-alerts
+    rules:
+      - alert: PhpCpuHigh
+        expr: sum(rate(container_cpu_usage_seconds_total{name="php"}[1m])) > 0.5
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "PHP 容器 CPU 使用率过高"
+          description: "当前 {{ $value | printf \"%.2f\" }} 核，阈值 0.5 核"
+
+      - alert: AppScrapeDown
+        expr: up{job="app"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "应用指标抓取失败"
+          description: "Prometheus 无法抓取 {{ $labels.instance }}"
+
+      - alert: DiskSpaceLow
+        expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} < 0.2
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "根分区可用空间不足 20%"
+          description: "剩余 {{ $value | printf \"%.1f\" }}"

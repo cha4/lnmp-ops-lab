@@ -7,6 +7,7 @@ services:
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
       - ./app:/var/www/html
+      - ./logs/nginx:/var/log/nginx
     depends_on:
       - php
     restart: unless-stopped
@@ -16,8 +17,8 @@ services:
     image: lnmp/php:1.0
     container_name: php
     environment:
-      DB_HOST: mysql
-      DB_PORT: "3306"
+      DB_HOST: proxysql
+      DB_PORT: "6033"
       DB_NAME: ${MYSQL_DATABASE}
       DB_USER: root
       DB_PASS: ${MYSQL_ROOT_PASSWORD}
@@ -28,6 +29,12 @@ services:
 
   mysql:
     image: mysql:8.0
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
     container_name: mysql
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}

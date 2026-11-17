@@ -1,0 +1,66 @@
+---
+- name: LNMP 环境初始化与配置下发
+  hosts: local
+  become: true
+
+  vars:
+    project_dir: /opt/lnmp
+    prom_interval: 5s
+    sysctl_params:
+      net.core.somaxconn: 4096
+      net.ipv4.tcp_max_syn_backlog: 8192
+      vm.max_map_count: 262144
+
+  tasks:
+    - name: 内核参数持久化
+      copy:
+        dest: /etc/sysctl.d/99-ansible-tuning.conf
+        content: |
+          # Managed by Ansible
+          {% for k, v in sysctl_params.items() %}
+          {{ k }} = {{ v }}
+          {% endfor %}
+      register: sysctl_conf
+
+    - name: 内核参数立即生效
+      command: sysctl --system
+      when: sysctl_conf.changed
+
+    - name: 创建项目目录
+      file:
+        path: "{{ project_dir }}/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - logs
+        - monitoring
+        - ansible
+
+    - name: 渲染 Prometheus 配置
+      template:
+        src: templates/prometheus.yml.j2
+        dest: "{{ project_dir }}/monitoring/prometheus.yml"
+        backup: yes
+      register: prom_conf
+
+    - name: 配置变更时重建 Prometheus
+      command: docker compose up -d --force-recreate prometheus
+      args:
+        chdir: "{{ project_dir }}"
+      when: prom_conf.changed
+
+    - name: 确保容器栈运行
+      command: docker compose up -d
+      args:
+        chdir: "{{ project_dir }}"
+      register: compose_out
+      changed_when: "'Started' in compose_out.stderr or 'Created' in compose_out.stderr"
+
+    - name: 获取容器状态
+      command: docker ps --format {% raw %}"{{.Names}} {{.Status}}"{% endraw %}
+      register: ps_out
+      changed_when: false
+
+    - name: 输出结果
+      debug:
+        msg: "{{ ps_out.stdout_lines }}"

@@ -1,158 +1,246 @@
-# LNMP 多服务环境 · 性能调优 · 监控告警 · 故障演练
+# 商品库存数据采集与监控分析系统
 
-> 在单台虚拟机上用 Docker Compose 编排 Nginx + PHP-FPM + MySQL + Redis，
-> 完成「跑通 → 压测 → 调优 → 监控 → 告警 → 故障演练 → 修复复验」的完整闭环。
+> 基于 Docker Compose 在单台虚拟机上构建 17 个容器的完整运维体系，
+> 覆盖服务编排、负载均衡、数据库主从与读写分离、监控告警、日志平台、备份容灾与配置自动化。
 
-## 1. 项目目标
+## 一、项目背景
 
-1. 环境能否一键复现？
-2. 承载能力上限在哪里？瓶颈是什么？
-3. 出了故障能不能被发现、被定位、被降级？
+商品仓储中心需要对库存数据、出入库单据、库位状态等进行实时采集与展示。
+随着访问量增长与系统复杂度提升，面临三个问题：
 
-## 2. 架构
+1. **部署依赖手工操作**，环境一致性难以保证，重建成本高
+2. **性能瓶颈缺乏量化依据**，容量规划依靠经验
+3. **运行状态缺少可观测性**，故障往往由用户侧反馈才发现
 
-| 层 | 容器 | 端口 | 职责 |
+本项目构建一套可快速复现、可量化评估、可观测告警的运维体系。
+
+## 二、架构总览
+
+```
+                        ┌─────────────────────────────────┐
+   用户 ──▶ 8080 ──▶ Nginx ──┬── /       ──▶ PHP-FPM ──▶ ProxySQL ──┬──▶ MySQL 主库（写）
+                            │                                       └──▶ MySQL 从库（读）
+                            └── /app/   ──▶ Tomcat A / Tomcat B（轮询）
+
+   采集层：
+     cAdvisor ─┐
+     node-exporter ─┼──▶ Prometheus ──▶ Grafana（面板）
+     应用指标 ─┘            └──▶ Alertmanager（告警路由）
+
+   日志层：
+     nginx 日志 ──▶ Filebeat ──▶ Logstash（grok 解析）──▶ Elasticsearch ──▶ Kibana
+
+   运维层：
+     Ansible（配置下发，幂等） · Crontab（定时备份） · Shell（备份/恢复）
+```
+
+### 容器清单（17 个）
+
+| 类别 | 容器 | 端口 | 说明 |
 |---|---|---|---|
-| 接入 | nginx | 8080 → 80 | 反向代理、静态资源、fastcgi 转发 |
-| 应用 | php | 9000（仅内网） | PHP-FPM + OPcache，执行页面逻辑 |
-| 数据 | mysql | 3306（仅内网） | 持久化到命名卷 `mysql-data` |
-| 缓存 | redis | 6379（仅内网） | 商品列表缓存，TTL 60s |
-| 监控 | prometheus / grafana / cadvisor / node-exporter | 9090 / 3000 | 采集、存储、可视化 |
+| 接入 | nginx | 8080→80 | 反向代理、静态资源、fastcgi、upstream |
+| 应用 | php | 内网 9000 | PHP-FPM + OPcache |
+| 应用 | tomcat-a / tomcat-b | 8081 / 8082 | Java 应用集群（inventory war） |
+| 数据 | mysql | 内网 3306 | 主库（写） |
+| 数据 | mysql-slave | 内网 3306 | 从库（读，super_read_only） |
+| 数据 | proxysql | 6033 / 6032 | 读写分离中间件 |
+| 数据 | redis | 内网 6379 | 缓存 |
+| 监控 | prometheus | 9090 | 指标采集与存储 |
+| 监控 | grafana | 3000 | 可视化 |
+| 监控 | alertmanager | 9093 | 告警路由 |
+| 监控 | cadvisor | 内网 | 容器指标 |
+| 监控 | node-exporter | 内网 | 主机指标 |
+| 日志 | elasticsearch | 9200 | 日志存储 |
+| 日志 | kibana | 5601 | 日志可视化 |
+| 日志 | logstash | 内网 5044 | 日志解析 |
+| 日志 | filebeat | — | 日志采集 |
 
-请求路径：浏览器 → nginx:8080 →（fastcgi）php:9000 → mysql:3306 或 redis:6379。
-容器间通过**容器名**互相访问，由 Docker 内置 DNS 解析。
+## 三、技术栈
 
-## 3. 运行环境
+CentOS 7.9 · Docker · Docker Compose · Nginx · PHP-FPM · Tomcat · MySQL 8.0 · ProxySQL · Redis
+· Prometheus · Alertmanager · Grafana · cAdvisor · node-exporter · Elasticsearch · Logstash · Kibana · Filebeat
+· Ansible · Shell · Crontab · Git
 
-| 项 | 版本 / 配置 |
-|---|---|
-| 虚拟机 | CentOS 7.9，4 vCPU / 8 GB / 60 GB |
-| Docker / Compose | 26.1.4 / v2.27.1 |
-| Nginx / PHP | 1.27.5-alpine / 8.2.35-fpm（pdo_mysql、redis、OPcache） |
-| MySQL / Redis | 8.0.46 / 7-alpine |
-| 监控 | Prometheus 2.54.1、Grafana 11.2.0、cAdvisor 0.53.0、node-exporter 1.8.2 |
-| 压测 | ab (ApacheBench 2.3) |
-
-## 4. 目录结构
+## 四、目录结构
 
 ```
 /opt/lnmp
-├── docker-compose.yml            # 服务编排
-├── docker-compose.override.yml   # OPcache 挂载 + 监控组件
-├── .env                          # 真实密码（不进 Git）
-├── .env.example                  # 变量模板（进 Git）
-├── nginx/default.conf            # 反代 + fastcgi + backlog
-├── php/
-│   ├── Dockerfile                # php:8.2-fpm + pdo_mysql + redis
-│   ├── opcache.ini
-│   └── zz-custom.conf            # 进程池：static, 16 worker
+├── docker-compose.yml               # 核心服务：nginx/php/mysql/redis
+├── docker-compose.override.yml      # 监控 + 日志 + 中间件扩展
+├── .env / .env.example              # 凭证（真实值不入库）
+├── nginx/default.conf               # 反代 + fastcgi + upstream + backlog
 ├── app/
-│   ├── index.php                 # 缓存 + 降级 + 熔断
-│   └── metrics.php               # 自研 Prometheus 指标端点
+│   ├── index.php                    # 缓存 + 降级 + 熔断 + 数据节点标识
+│   └── metrics.php                  # 自定义 Prometheus 指标端点
+├── php/                             # Dockerfile + OPcache + FPM 进程池
+├── tomcat/
+│   ├── webapp/                      # JSP 源码
+│   └── app.war                      # 构建产物
 ├── sql/init.sql
 ├── monitoring/
-│   ├── prometheus.yml
-│   └── grafana/provisioning/datasources/prometheus.yml
-├── docs/
-│   ├── STATUS.md
-│   └── drill-redis-degradation.md
+│   ├── prometheus.yml               # 由 Ansible 渲染
+│   ├── alertmanager.yml             # 告警路由
+│   ├── rules/lnmp.yml               # Prometheus 告警规则
+│   ├── logstash/pipeline/           # grok 解析规则
+│   ├── filebeat/filebeat.yml        # 日志采集配置
+│   └── grafana/provisioning/        # 数据源
+├── ansible/                         # inventory + site.yml（幂等）
+├── scripts/                         # backup-full.sh / restore.sh
+├── docs/                            # 故障复盘文档
 └── README.md
 ```
 
-## 5. 快速开始
+## 五、快速开始
 
 ```bash
-cp .env.example .env      # 填入真实密码
-docker compose up -d
-curl -s http://localhost:8080 | grep 状态
+cp .env.example .env          # 填入真实密码
+docker compose up -d          # 拉起全部服务
+docker compose ps             # 确认 17 个容器 Up
 ```
 
-- 应用：http://<ip>:8080
-- Grafana：http://<ip>:3000（admin / 见 .env）
-- Prometheus：http://<ip>:9090
+访问入口：
 
-## 6. 关键设计
+| 服务 | 地址 |
+|---|---|
+| 应用 | http://<ip>:8080 |
+| Tomcat 集群 | http://<ip>:8080/app/ |
+| Grafana | http://<ip>:3000 |
+| Prometheus | http://<ip>:9090 |
+| Alertmanager | http://<ip>:9093 |
+| Kibana | http://<ip>:5601 |
 
-| 设计 | 做法 | 原因 |
-|---|---|---|
-| 服务发现 | `fastcgi_pass php:9000`、`host=mysql` | 用容器名而非 IP，容器重建后地址变化不影响 |
-| 启动依赖 | `depends_on` + `healthcheck` | 前者只管顺序，后者才判断“真的可用” |
-| 数据持久化 | 命名卷 `mysql-data` | 容器删除数据仍在 |
-| 字符集 | 建表 utf8mb4 + 连接串 charset + `SET NAMES` | 三处一致，否则双重编码 |
-| 配置与秘钥 | `.env` + 环境变量 | 敏感信息不进版本库 |
+## 六、核心模块与实测结果
 
-## 7. 性能优化（四轮）
+### 1. 服务编排
 
-| 阶段 | 关键改动 | QPS | P95 | P99 |
-|---|---|---|---|---|
-| 基线 | 默认 5 worker / dynamic | 598 | 382 ms | 3014 ms |
-| 第一轮 | worker → 8 / static | 950 | 136 ms | 1325 ms |
-| 第二轮 | + OPcache + PDO 持久连接 | 980 | 90 ms | 1098 ms |
-| 第三轮 | + Redis 缓存 | 1558 | 130 ms | 1084 ms |
-| 第四轮 | + 内核队列 + worker 16 | **1700** | **125 ms** | **1082 ms** |
-| 累计 | | **+184%** | **−67%** | **−64%** |
+自定义 bridge 网络实现容器名服务发现，healthcheck 保障启动依赖，命名卷持久化数据。
+一条命令重建整套环境。
 
-每一轮的依据：
+### 2. Nginx + Tomcat 集群（负载均衡与故障切换）
 
-- **基线反推**：`598 × 0.008s ≈ 5`，恰好等于 `pm.max_children` 默认值，锁定进程数瓶颈。
-- **进程数**：4 核机器上超过 8 个 worker 后 QPS 不再增长，32 个反而下降（上下文切换）。
-- **OPcache / 持久连接**：QPS 不变但 P95 从 136→90ms，说明优化的是延迟不是吞吐。
-- **Redis**：MySQL CPU 从 94% 降到 0.6%，QPS 提升 59%。
-- **内核队列**：`ListenOverflows=101`，`somaxconn=128` 导致半连接队列溢出、SYN 重传，表现为 2 秒级尾延迟。
+两个 Tomcat 节点部署同一个 war 包，Nginx 用 upstream 轮询，配置被动健康检查。
 
-压测方法：`ab -n 20000 -c 200 -k`，预热缓存后连跑三次取中位数。
-⚠️ 单机压测（压测端与被测端共享 4 核），数据偏保守，仅用于前后对比。
+**实测结果**：
 
-## 8. 监控与告警
+| 场景 | 结果 |
+|---|---|
+| 正常 20 次请求 | 两节点各 10 次，完全均分 |
+| 停掉一个节点 | **100% 转到存活节点，0 失败，耗时 5ms** |
 
-**采集**：cAdvisor（容器）、node-exporter（主机）、自研 `/metrics.php`（应用），Prometheus 每 5s 拉取。
+**关键配置**：
 
-**面板**（Grafana「LNMP 监控」）：容器 CPU／内存／网络、主机负载、QPS、关键状态（存活容器、抓取状态）。
-
-**告警**：`PHP 容器 CPU > 0.5 核`，评估周期 10s、Pending 30s，Webhook 通知。
-
-**验证**：压测触发后状态 `Normal → Pending → Firing`，21:59 触发、22:01 恢复，Webhook 收到 `firing` 与 `resolved` 两条通知。
-
-**自研指标端点**（`app/metrics.php`）：
-
-```
-app_requests_total 12345     # 请求总数（读本地文件，不依赖 Redis）
+```nginx
+upstream tomcat_cluster {
+    server tomcat-a:8080 max_fails=1 fail_timeout=30s;
+    server tomcat-b:8080 max_fails=1 fail_timeout=30s;
+}
+proxy_connect_timeout 2s;                 # 默认 60s 会导致请求挂死
+proxy_next_upstream error timeout http_502 http_503 http_504;
 ```
 
-> 设计要点：**观测端点不能依赖被观测的依赖**。最初 `/metrics.php` 需要连 Redis，Redis 一挂监控目标直接 DOWN，什么都看不到；改为读本地文件后，故障期间监控仍可用。
+> **踩坑**：容器停机后 IP 仍在网桥上，连接是「黑洞超时」而非快速拒绝。
+> 默认 60 秒连接超时会让请求挂死 5 秒以上（日志表现为 499 而非 502）。
 
-## 9. 故障演练
+### 3. MySQL 主从 + ProxySQL 读写分离
 
-### 缓存不可用（Redis 停机）
+主从基于 **GTID** 复制（避免位点漂移），从库设置 `super_read_only` 防止误写；
+ProxySQL 按 hostgroup 分流：10 = 写组，20 = 读组，`^SELECT` 路由到读组。
 
-| 指标 | 修复前 | 修复后 |
+**实测结果**：
+
+| 检查项 | 结果 |
+|---|---|
+| 复制状态 | IO/SQL 均 Yes，延迟 0 秒 |
+| 写入同步 | 主库写入 2 秒内从库可见 |
+| 读路由 | 页面显示 `server_id=2`（从库） |
+| 从库保护 | 写入被拒绝（ERROR 1290） |
+
+> **踩坑**：容器内的 socket 连接异常，必须用 `-h127.0.0.1` 走 TCP；
+> `--super-read-only` 会阻断初始化脚本，需在建好复制后再开启。
+
+### 4. 监控与告警
+
+Prometheus 采集容器（cAdvisor）、主机（node-exporter）、应用（自研端点）三层指标，
+Grafana 配置 6 个面板；告警规则交由 Prometheus 评估、Alertmanager 路由。
+
+**实测结果**：压测时 PHP CPU 从 0.39 → 1.31 核，告警状态 `pending → firing`，
+Alertmanager 收到告警（携带实际值 1.21 核），压测停止后自动恢复。
+
+**关键设计**：自研指标端点采用**本地文件计数**，不依赖 Redis——
+否则缓存故障时监控端点一起超时，故障期间完全看不到数据。
+
+### 5. ELK 日志平台
+
+nginx 访问日志落盘 → Filebeat 采集 → Logstash 用 grok 解析 → ES 存储 → Kibana 查询。
+
+**实测结果**：
+
+| 指标 | 结果 |
+|---|---|
+| 索引文档数 | 150+ |
+| 集群状态 | green |
+| 字段解析 | clientip / method / status / bytes / user_agent 全部结构化 |
+| 聚合查询 | 按状态码聚合正常（200 × N） |
+
+**关键配置**：`vm.max_map_count=262144`（ES 必需）、单节点模式、关闭安全认证、
+JVM 堆限制 1G、索引副本 0（单节点无法分配副本否则一直是 yellow）。
+
+### 6. 备份与容灾
+
+全量备份（mysqldump + gzip + 保留 7 天）+ binlog 归档，Crontab 每天 02:00 执行。
+
+**演练过程与结果**：
+
+| 步骤 | 结果 |
+|---|---|
+| 备份 | 生成 `shop_YYYYmmdd_HHMMSS.sql.gz` + 4 个 binlog |
+| 模拟灾难 | `DROP TABLE` → 查询报 ERROR 1146 |
+| 恢复 | **RTO 592 毫秒** |
+| 数据校验 | 主从各 5 条，内容一致，中文正常 |
+| 复制状态 | 恢复后 IO/SQL 仍为 Yes |
+
+**踩的四个坑**：
+
+| 现象 | 根因 | 解决 |
 |---|---|---|
-| 页面 | 报错（HTTP 200 但内容失败） | 正常显示商品 |
-| QPS | 20.37 | **857.67** |
-| P95 | 5172 ms | **183 ms** |
-| MySQL CPU | 0.02 核（未被访问） | 0.156 核 |
-| 首请求耗时 | 5 s（DNS 超时） | 0.102 s（熔断） |
+| `GTID_PURGED cannot be changed` | 备份的 GTID 集合与本机已执行重叠 | 恢复时剔除该行 |
+| 中文变 `????` | 客户端默认 latin1 | 备份/恢复都加 `--default-character-set=utf8mb4` |
+| 恢复后从库没数据 | **mysqldump 内含 `SET SQL_LOG_BIN=0`** | 恢复时一并剔除 |
+| 从库 SQL 线程停止（1051） | 主库 DROP 在从库执行时表已不存在 | 重建从库 |
 
-修复手段：**降级**（Redis 失败回退查 MySQL）+ **熔断**（失败后 30s 内不再尝试 Redis）。
-详见 `docs/drill-redis-degradation.md`。
+### 7. Ansible 自动化
 
-### 其他已遇到的问题
+`site.yml` 完成内核参数下发、目录创建、Prometheus 配置渲染（Jinja2 模板）、容器编排。
 
-| 问题 | 根因 | 处理 |
+**幂等性实测**：
+
+```
+第一次执行：changed=3
+第二次执行：changed=0    ← 重复执行不产生变更
+```
+
+## 七、其他问题与解决
+
+| 问题 | 根因 | 解决 |
 |---|---|---|
-| 容器全 Up 但端口不通 | firewalld 重新启用，覆盖 Docker 转发规则 | 关闭 firewalld + 重启 Docker |
-| 改配置容器不生效 | `sed -i` 替换 inode，bind mount 仍指向旧文件 | 重建容器，或原地写入 |
-| 中文乱码 | 导入时客户端字符集为 latin1，双重编码 | `--default-character-set=utf8mb4` + `SET NAMES` |
-| 指标查不到 | cAdvisor 该版本用 `name` 标签而非 `container` | 先查 label 再写 PromQL |
+| 容器 Up 但端口不通 | firewalld 重新启用覆盖 Docker 规则 | 关闭 firewalld + 重启 Docker |
+| 改配置容器不生效 | `sed -i` 替换 inode，bind mount 仍指向旧文件 | 用 `cat >` 原地写入或重建容器 |
 | 改代码不生效 | OPcache `validate_timestamps=0` | 重启 php 容器 |
+| 端口冲突 | GitLab/监控组件都想用 80 | 统一规划端口（8081/8082/5601/9200） |
+| 镜像拉取超时 | Docker Hub 与 ES CDN 被墙 | 走代理 + 多源重试 |
 
-## 10. 已知问题与规划
+## 八、已知问题与规划
 
-- 单机部署：应用与数据库均为单实例，存在单点。
-- 单机压测：数据偏保守，绝对值无参考意义。
-- 未实现限流：数据库被打满时缺少保护。
-- 规划：双节点 + upstream 健康检查、MySQL 主从、限流与熔断策略完善。
+- 单机部署，应用与数据库均为单实例，存在单点
+- 未实现限流，数据库被打满时缺少保护
+- ELK 未做索引生命周期管理（ILM），日志会持续增长
+- 规划：双机 + Keepalived 高可用、MySQL 半同步复制、接入 CI/CD 流水线
 
-## 11. 技术栈
+## 九、文档
 
-Nginx · PHP-FPM · MySQL · Redis · Docker · Docker Compose · Prometheus · Grafana · cAdvisor · Linux 内核调优
+- `docs/STATUS.md` — 环境状态与变更记录
+- `docs/drill-redis-degradation.md` — 缓存降级故障复盘
+
+## 十、仓库
+
+https://github.com/cha4/lnmp-ops-lab
