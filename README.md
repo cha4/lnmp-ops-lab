@@ -1,6 +1,6 @@
 # 商品库存数据采集与监控分析系统
 
-> 基于 Docker Compose 在单台虚拟机上构建 17 个容器的完整运维体系，
+> 基于 Docker Compose 在单台虚拟机上构建 19 个容器的完整运维体系，
 > 覆盖服务编排、负载均衡、数据库主从与读写分离、监控告警、日志平台、备份容灾与配置自动化。
 
 ## 一、项目背景
@@ -34,7 +34,7 @@
      Ansible（配置下发，幂等） · Crontab（定时备份） · Shell（备份/恢复）
 ```
 
-### 容器清单（17 个）
+### 容器清单（19 个）
 
 | 类别 | 容器 | 端口 | 说明 |
 |---|---|---|---|
@@ -54,12 +54,14 @@
 | 日志 | kibana | 5601 | 日志可视化 |
 | 日志 | logstash | 内网 5044 | 日志解析 |
 | 日志 | filebeat | — | 日志采集 |
+| 交付 | gitlab | 8083 / 2222 | 代码仓库与 Webhook |
+| 交付 | jenkins | 8084 / 50001 | 流水线引擎 |
 
 ## 三、技术栈
 
 CentOS 7.9 · Docker · Docker Compose · Nginx · PHP-FPM · Tomcat · MySQL 8.0 · ProxySQL · Redis
 · Prometheus · Alertmanager · Grafana · cAdvisor · node-exporter · Elasticsearch · Logstash · Kibana · Filebeat
-· Ansible · Shell · Crontab · Git
+· Ansible · Shell · Crontab · Jenkins · GitLab · Git
 
 ## 四、目录结构
 
@@ -95,7 +97,7 @@ CentOS 7.9 · Docker · Docker Compose · Nginx · PHP-FPM · Tomcat · MySQL 8.
 ```bash
 cp .env.example .env          # 填入真实密码
 docker compose up -d          # 拉起全部服务
-docker compose ps             # 确认 17 个容器 Up
+docker compose ps             # 确认 19 个容器 Up
 ```
 
 访问入口：
@@ -108,6 +110,8 @@ docker compose ps             # 确认 17 个容器 Up
 | Prometheus | http://<ip>:9090 |
 | Alertmanager | http://<ip>:9093 |
 | Kibana | http://<ip>:5601 |
+| GitLab | http://<ip>:8083 |
+| Jenkins | http://<ip>:8084 |
 
 ## 六、核心模块与实测结果
 
@@ -218,6 +222,45 @@ JVM 堆限制 1G、索引副本 0（单节点无法分配副本否则一直是 y
 第一次执行：changed=3
 第二次执行：changed=0    ← 重复执行不产生变更
 ```
+
+### 8. CI/CD 流水线
+
+基于 GitLab + Jenkins 实现「提交即部署」：代码推送到 GitLab 触发 Webhook，Jenkins 依次执行五个阶段。
+
+```
+提交代码 → GitLab → Webhook → Jenkins
+                                  ├─ ① 检出代码
+                                  ├─ ② 配置语法检查（compose config -q）
+                                  ├─ ③ 构建镜像（打构建号标签）
+                                  ├─ ④ 部署（compose up -d php nginx）
+                                  └─ ⑤ 冒烟测试（首页 + 应用页均要求 200）
+```
+
+**实测结果**：
+
+| 验证项 | 结果 |
+|---|---|
+| 手动触发构建 | 通过 |
+| GitLab 测试推送触发 | 触发成功（`201 Created`） |
+| 真实提交自动触发 | 提交 → 推送 → 自动构建 #6 → SUCCESS |
+| 冒烟测试 | 首页 200、应用页 200 |
+
+**关键设计**：
+
+- 冒烟测试带**重试**（12 次 × 5 秒），避免容器刚重建未就绪造成误判
+- 冒烟测试目标用**容器网络名**（`http://nginx:80`），不能用 `127.0.0.1`——流水线在 Jenkins 容器内执行，`127.0.0.1:8080` 指向的是 Jenkins 自己
+- 镜像标签带构建号，每次部署可追溯到具体版本
+- 任一阶段失败立即中止，不继续部署
+
+**踩的坑**：
+
+| 问题 | 原因 | 解决 |
+|---|---|---|
+| 端口冲突 | GitLab 想用 8081/8082，被 Tomcat 占用 | 改为 8083/8084 |
+| 外部访问 000 | `external_url` 带端口后，容器内 nginx 监听该端口 | 映射改为 `8083:8083` |
+| Webhook 401/403 | Jenkins CSRF 保护 | 关闭 CSRF（实验环境） |
+| Webhook "Invalid url" | GitLab 默认禁止访问内网 | 开启 `allow_local_requests_from_web_hooks_and_services` |
+| 冒烟测试误判 | 在容器内测 `127.0.0.1` | 改用容器名 |
 
 ## 七、其他问题与解决
 

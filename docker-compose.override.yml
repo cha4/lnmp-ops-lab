@@ -118,8 +118,53 @@ services:
       - logstash
     restart: unless-stopped
 
+  gitlab:
+    image: gitlab/gitlab-ce:17.5.2-ce.0
+    container_name: gitlab
+    hostname: gitlab.local
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://192.168.255.131:8083'
+        gitlab_rails['gitlab_shell_ssh_port'] = 2222
+        puma['worker_processes'] = 0
+        sidekiq['max_concurrency'] = 5
+        prometheus_monitoring['enable'] = false
+        gitlab_rails['time_zone'] = 'Asia/Shanghai'
+    ports:
+      - "8083:8083"
+      - "2222:22"
+    volumes:
+      - gitlab-config:/etc/gitlab
+      - gitlab-logs:/var/log/gitlab
+      - gitlab-data:/var/opt/gitlab
+    shm_size: 256m
+    restart: unless-stopped
+
+  jenkins:
+    image: jenkins/jenkins:lts-jdk17
+    container_name: jenkins
+    user: root
+    environment:
+      - JAVA_OPTS=-Xmx1g -Djenkins.install.runSetupWizard=false -Dhudson.security.csrf.GlobalCrumbIssuerConfiguration.DISABLE_CSRF_PROTECTION=true
+      - HTTP_PROXY=http://192.168.255.1:7897
+      - HTTPS_PROXY=http://192.168.255.1:7897
+      - NO_PROXY=localhost,127.0.0.1,gitlab,gitlab.local
+    ports:
+      - "8084:8080"
+      - "50001:50000"
+    volumes:
+      - jenkins-home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/local/bin/docker:ro
+      - /usr/libexec/docker/cli-plugins:/usr/local/lib/docker/cli-plugins:ro
+      - /opt/lnmp:/opt/lnmp
+    restart: unless-stopped
+
 volumes:
   prom-data:
   grafana-data:
   es-data:
-
+  gitlab-config:
+  gitlab-logs:
+  gitlab-data:
+  jenkins-home:
