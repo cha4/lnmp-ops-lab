@@ -1,0 +1,64 @@
+<?xml version='1.1' encoding='UTF-8'?>
+<project>
+  <description>LNMP 项目 CI/CD：检出 -&gt; 检查 -&gt; 构建 -&gt; 部署 -&gt; 验证</description>
+  <keepDependencies>false</keepDependencies>
+  <properties/>
+  <scm class="hudson.scm.NullSCM"/>
+  <canRoam>true</canRoam>
+  <disabled>false</disabled>
+  <blockBuildWhenDownstreamBuilding>false</blockBuildWhenDownstreamBuilding>
+  <blockBuildWhenUpstreamBuilding>false</blockBuildWhenUpstreamBuilding>
+  <triggers>
+    <hudson.triggers.TokenTrigger>
+      <spec>lnmp-cicd-token</spec>
+    </hudson.triggers.TokenTrigger>
+  </triggers>
+  <concurrentBuild>false</concurrentBuild>
+  <builders>
+    <hudson.tasks.Shell>
+      <command>set -e
+echo "===== 阶段 1：检出代码 ====="
+cd /opt/lnmp
+git log -1 --oneline</command>
+    </hudson.tasks.Shell>
+    <hudson.tasks.Shell>
+      <command>set -e
+echo "===== 阶段 2：配置语法检查 ====="
+cd /opt/lnmp
+docker compose config -q
+echo "compose 配置校验通过"</command>
+    </hudson.tasks.Shell>
+    <hudson.tasks.Shell>
+      <command>set -e
+echo "===== 阶段 3：构建镜像 ====="
+cd /opt/lnmp
+DOCKER_BUILDKIT=0 docker build -t lnmp/php:build-${BUILD_NUMBER} ./php
+docker tag lnmp/php:build-${BUILD_NUMBER} lnmp/php:1.0
+echo "镜像构建完成"</command>
+    </hudson.tasks.Shell>
+    <hudson.tasks.Shell>
+      <command>set -e
+echo "===== 阶段 4：部署 ====="
+cd /opt/lnmp
+docker compose up -d php nginx
+echo "部署完成"</command>
+    </hudson.tasks.Shell>
+    <hudson.tasks.Shell>
+      <command>set -e
+echo "===== 阶段 5：冒烟测试 ====="
+check() {
+  for i in $(seq 1 12); do
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$1")
+    if [ "$code" = "200" ]; then echo "$2 通过 ($code)"; return 0; fi
+    echo "  等待中... 第 $i 次: $code"; sleep 5
+  done
+  echo "$2 失败: $code"; return 1
+}
+check http://nginx:80/ "应用首页"
+check http://nginx:80/app/ "Tomcat 应用"
+echo "所有冒烟测试通过"</command>
+    </hudson.tasks.Shell>
+  </builders>
+  <publishers/>
+  <buildWrappers/>
+</project>
