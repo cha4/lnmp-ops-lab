@@ -2,6 +2,13 @@
 # MySQL 全量备份：mysqldump + gzip + 保留 7 天
 set -euo pipefail
 
+# 从 .env 读取凭证（不硬编码）
+set -a
+[ -f /opt/lnmp/.env ] && . /opt/lnmp/.env
+set +a
+DB_PASS="${MYSQL_ROOT_PASSWORD:?未设置 MYSQL_ROOT_PASSWORD}"
+
+
 BACKUP_DIR=/backup/mysql
 KEEP_DAYS=7
 TS=$(date +%Y%m%d_%H%M%S)
@@ -13,10 +20,10 @@ log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 log "========== 全量备份开始 =========="
 
 # 备份前切分 binlog，便于增量恢复定位
-docker exec mysql mysql -uroot -pRoot@123456 -e "FLUSH LOGS;" 2>/dev/null || true
+docker exec mysql mysql -uroot -p"$DB_PASS" -e "FLUSH LOGS;" 2>/dev/null || true
 
 # 全量导出（--single-transaction 不锁表；--set-gtid-purged=ON 带 GTID）
-if docker exec mysql mysqldump -uroot -pRoot@123456 \
+if docker exec mysql mysqldump -uroot -p"$DB_PASS" \
      --single-transaction --quick --set-gtid-purged=ON \
      --default-character-set=utf8mb4 \
      --databases shop 2>/dev/null | gzip > "$FILE"; then
